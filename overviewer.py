@@ -34,6 +34,7 @@ import time
 import logging
 from argparse import ArgumentParser
 from collections import OrderedDict
+from diskcache import Cache
 
 from overviewer_core import util
 from overviewer_core import logger
@@ -475,6 +476,8 @@ def main():
     caches = []
     caches.append(cache.LRUCache(size=100))
     # TODO: optionally more caching layers here
+    # use diskcache for re-using generated textures, shaves loading-time on startup
+    texdiskcache = Cache("texdiskcache")
 
     renders = config['renders']
     for render_name, render in renders.items():
@@ -500,11 +503,20 @@ def main():
         texopts = util.dict_subset(render, ["texturepath", "bgcolor", "northdirection"])
         texopts_key = tuple(texopts.items())
         if texopts_key not in texcache:
-            tex = textures.Textures(**texopts)
-            logging.info("Generating textures...")
-            tex.generate()
-            logging.debug("Finished generating textures.")
+            # use the texture-file's modified-time as key, to auto-invalidate when updated
+            texcache_dkey = str(os.path.getmtime(texopts["texturepath"]))
+
+            if texdiskcache.get(texcache_dkey):
+                logging.info("Got textures from texturediskcache!")
+                tex = texdiskcache[texcache_dkey]
+            else:
+                tex = textures.Textures(**texopts)
+                logging.info("Generating textures...")
+                tex.generate()
+                logging.debug("Finished generating textures.")
+                texdiskcache[texcache_dkey] = tex
             texcache[texopts_key] = tex
+
         else:
             tex = texcache[texopts_key]
 
