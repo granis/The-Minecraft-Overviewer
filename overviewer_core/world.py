@@ -2163,6 +2163,7 @@ class RotatedRegionSet(RegionSetWrapper):
         self.north_dir = north_dir
         self.unrotate = self._unrotation_funcs[north_dir]
         self.rotate = self._rotation_funcs[north_dir]
+        self.chunkcache = cache.LRUCache(size=1024)
 
         super(RotatedRegionSet, self).__init__(rsetobj)
 
@@ -2175,6 +2176,12 @@ class RotatedRegionSet(RegionSetWrapper):
         self.__init__(args[0], args[1])
 
     def get_chunk(self, x, z):
+        chunkkey = f"{x}_{z}"
+        try:
+            return self.chunkcache[chunkkey]
+        except KeyError:
+            pass
+
         x,z = self.unrotate(x,z)
         chunk_data = dict(super(RotatedRegionSet, self).get_chunk(x,z))
         newsections = []
@@ -2191,6 +2198,7 @@ class RotatedRegionSet(RegionSetWrapper):
                 array = numpy.swapaxes(array, 0,2)
                 section[arrayname] = array
         chunk_data['Sections'] = newsections
+        self.chunkcache[chunkkey] = chunk_data
 
         return chunk_data
 
