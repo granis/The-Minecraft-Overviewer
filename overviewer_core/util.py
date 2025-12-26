@@ -18,7 +18,6 @@ Misc utility routines used by multiple files that don't belong anywhere else
 """
 
 import errno
-import imp
 import os.path
 import platform
 import sys
@@ -26,17 +25,42 @@ from itertools import cycle, islice, product
 from string import hexdigits
 from subprocess import PIPE, Popen
 
+DIMENSION_INFO = {
+    "minecraft:overworld": ("DIM0", 0, "minecraft:overworld"),
+    "minecraft:the_end": ("DIM1", 1, "minecraft:the_end"),
+    "minecraft:the_nether": ("DIM-1", -1, "minecraft:the_nether"),
+}
+
+
+def get_dimension_data(dimension):
+    if isinstance(dimension, int):
+        for dim_name, (folder, dim_id, _) in DIMENSION_INFO.items():
+            if dim_id == dimension:
+                return DIMENSION_INFO[dim_name]
+    elif isinstance(dimension, str):
+        if dimension in DIMENSION_INFO:
+            return DIMENSION_INFO[dimension]
+        elif dimension in ("overworld"):
+            return DIMENSION_INFO["minecraft:overworld"]
+        elif dimension in ("the_end", "end"):
+            return DIMENSION_INFO["minecraft:the_end"]
+        elif dimension in ("the_nether", "nether"):
+            return DIMENSION_INFO["minecraft:the_nether"]
+
+    return None
+
 
 def get_program_path():
-    if hasattr(sys, "frozen") or imp.is_frozen("__main__"):
+    # Check if running as a frozen executable (e.g., created with PyInstaller)
+    if getattr(sys, "frozen", False):
         return os.path.dirname(sys.executable)
-    else:
-        try:
-            # normally, we're in ./overviewer_core/util.py
-            # we want ./
-            return os.path.dirname(os.path.dirname(__file__))
-        except NameError:
-            return os.path.dirname(sys.argv[0])
+    
+    # If not frozen, attempt to use __file__ or sys.argv[0] to determine the script path
+    try:
+        return os.path.dirname(os.path.dirname(__file__))  # For normal script run
+    except NameError:
+        # Fall back to sys.argv[0] if __file__ is not available (e.g., when running interactively)
+        return os.path.dirname(sys.argv[0])
 
 
 def findGitHash():
@@ -55,33 +79,6 @@ def findGitHash():
     return "unknown"
 
 
-def findGitVersion():
-    try:
-        p = Popen('git describe --tags --match "v*.*.*"', stdout=PIPE, stderr=PIPE, shell=True)
-        p.stderr.close()
-        line = p.stdout.readlines()[0].decode('utf-8')
-        if line.startswith('release-'):
-            line = line.split('-', 1)[1]
-        if line.startswith('v'):
-            line = line[1:]
-        # turn 0.1.0-50-somehash into 0.1.50
-        # and 0.1.0 into 0.1.0
-        line = line.strip().replace('-', '.').split('.')
-        if len(line) == 5:
-            del line[4]
-            del line[2]
-        else:
-            assert len(line) == 3
-            line[2] = '0'
-        line = '.'.join(line)
-        return line
-    except Exception:
-        try:
-            from . import overviewer_version
-            return overviewer_version.VERSION
-        except Exception:
-            return "unknown"
-        
 def findGitTag():
     try:
         p = Popen('git describe --tags --abbrev=0', stdout=PIPE, stderr=PIPE, shell=True)
@@ -95,7 +92,6 @@ def findGitTag():
         except Exception:
             pass
     return "unknown"
-
 
 
 def is_bare_console():

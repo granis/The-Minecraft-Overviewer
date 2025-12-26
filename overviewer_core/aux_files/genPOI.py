@@ -32,6 +32,7 @@ from multiprocessing import Pool
 from argparse import ArgumentParser
 
 from overviewer_core import config_parser, logger, nbt, world
+from overviewer_core.textParser import TextParser
 from overviewer_core.files import FileReplacer, get_fs_caps
 
 UUID_LOOKUP_URL = 'https://sessionserver.mojang.com/session/minecraft/profile/'
@@ -51,48 +52,6 @@ def replaceBads(s):
     for bad in bads:
         x = x.replace(bad, "_")
     return x
-
-
-# If you want to keep your stomach contents do not, under any circumstance,
-# read the body of the following function. You have been warned.
-# All of this could be replaced by a simple json.loads if Mojang had
-# introduced a TAG_JSON, but they didn't.
-#
-# So here are a few curiosities how 1.7 signs get seen in 1.8 in Minecraft:
-# - null        ->
-# - "null"      -> null
-# - ["Hello"]   -> Hello
-# - [Hello]     -> Hello
-# - [1,2,3]     -> 123
-# Mojang just broke signs for everyone who ever used [, { and ". GG.
-def jsonText(s):
-    if s is None or s == "null":
-        return ""
-    if ((s.startswith('"') and s.endswith('"')) or
-            (s.startswith('{') and s.endswith('}'))):
-        try:
-            js = json.loads(s)
-        except ValueError:
-            return s
-
-        def parseLevel(foo):
-            bar = ""
-            if isinstance(foo, list):
-                for extra in foo:
-                    bar += parseLevel(extra)
-            elif isinstance(foo, dict):
-                if "text" in foo:
-                    bar += foo["text"]
-                if "extra" in foo:
-                    bar += parseLevel(foo["extra"])
-            elif isinstance(foo, str):
-                bar = foo
-            return bar
-
-        return parseLevel(js)
-
-    else:
-        return s
 
 
 # Since functions are not pickleable, we send their names instead.
@@ -125,14 +84,22 @@ def parseBucketChunks(task_tuple):
     pid = multiprocessing.current_process().pid
     markers = defaultdict(list)
 
+    parser = TextParser(logging.getLogger("textParser"))
+
     i = 0
     cnt = 0
     for b in bucket:
         try:
-            data = rset.get_chunk(b[0], b[1])
+            data = rset.get_chunk_lite(b[0], b[1])
+            data_version = data.get('DataVersion', 0)
             for poi in itertools.chain(data.get('TileEntities', []), data.get('Entities', []), data.get('block_entities', [])):
-                if poi['id'] == 'Sign' or poi['id'] == 'minecraft:sign':
-                    poi = signWrangler(poi)
+                if poi['id'] in ['Sign', 'minecraft:sign', 'minecraft:hanging_sign']:
+                    parser.parse_sign(poi, data_version)
+
+                if 'CustomName' in poi:
+                    poi['CustomNameHtml'] = parser.parse_text_component(poi['CustomName'], data_version, True)
+                    poi['CustomName'] = parser.parse_text_component(poi['CustomName'], data_version, False)
+
                 for name, filter_function in filters:
                     ff = bucketChunkFuncs[filter_function]
                     result = ff(poi)
@@ -155,23 +122,6 @@ def parseBucketChunks(task_tuple):
     return markers
 
 
-def signWrangler(poi):
-    """
-    Just does the JSON things for signs
-    """
-    if "Text1" in poi:
-        for field in ["Text1", "Text2", "Text3", "Text4"]:
-            poi[field] = jsonText(poi[field])
-    else:
-        for field in ["front_text", "back_text"]:
-            if field in poi:
-                messages = poi[field].get("messages", [])
-                for i in range(len(messages)):
-                    messages[i] = jsonText(messages[i])
-    return poi
-
-
-
 def handleEntities(rset, config, config_path, filters, markers):
     """
     Add markers for Entities or TileEntities.
@@ -187,51 +137,32 @@ def handleEntities(rset, config, config_path, filters, markers):
     if numbuckets < 0:
         numbuckets = multiprocessing.cpu_count()
 
-    if numbuckets == 1:
-        for (x, z, mtime) in rset.iterate_chunks():
-            try:
-                data = rset.get_chunk(x, z)
-                for poi in itertools.chain(data.get('TileEntities', []), data.get('Entities', []), data.get('block_entities', [])):
-                    if poi['id'] == 'Sign' or poi['id'] == 'minecraft:sign':    # kill me
-                        poi = signWrangler(poi)
-                    for name, __, filter_function, __, __, __ in filters:
-                        result = filter_function(poi)
-                        if result:
-                            d = create_marker_from_filter_result(poi, result)
-                            markers[name]['raw'].append(d)
-            except nbt.CorruptChunkError:
-                logging.warning("Ignoring POIs in corrupt chunk %d,%d.", x, z)
-            except world.ChunkDoesntExist:
-                # iterate_chunks() doesn't inspect chunks and filter out
-                # placeholder ones. It's okay for this chunk to not exist.
-                pass
-    else:
-        buckets = [[] for i in range(numbuckets)]
+    buckets = [[] for i in range(numbuckets)]
 
-        for (x, z, mtime) in rset.iterate_chunks():
-            i = x // 32 + z // 32
-            i = i % numbuckets
-            buckets[i].append([x, z])
+    for (x, z, mtime) in rset.iterate_chunks():
+        i = x // 32 + z // 32
+        i = i % numbuckets
+        buckets[i].append([x, z])
 
-        for b in buckets:
-            logging.info("Buckets has %d entries.", len(b))
+    for b in buckets:
+        logging.info("Buckets has %d entries.", len(b))
 
-        # Create a pool of processes and run all the functions
-        pool = Pool(processes=numbuckets, initializer=initBucketChunks, initargs=(config_path,))
+    # Create a pool of processes and run all the functions
+    pool = Pool(processes=numbuckets, initializer=initBucketChunks, initargs=(config_path,))
 
-        # simplify the filters dict, so pickle doesn't have to do so much
-        filters = [(name, filter_function.__name__) for name, __, filter_function, __, __, __
-                   in filters]
+    # simplify the filters dict, so pickle doesn't have to do so much
+    filters = [(name, filter_function.__name__) for name, __, filter_function, __, __, __
+               in filters]
 
-        results = pool.map(parseBucketChunks, ((buck, rset, filters) for buck in buckets))
+    results = pool.map(parseBucketChunks, ((buck, rset, filters) for buck in buckets))
 
-        pool.close()
-        pool.join()
-        logging.info("All the threads completed.")
+    pool.close()
+    pool.join()
+    logging.info("All the threads completed.")
 
-        for marker_dict in results:
-            for name, marker_list in marker_dict.items():
-                markers[name]['raw'].extend(marker_list)
+    for marker_dict in results:
+        for name, marker_list in marker_dict.items():
+            markers[name]['raw'].extend(marker_list)
 
     logging.info("Done.")
 
@@ -371,10 +302,10 @@ def handlePlayers(worldpath, filters, markers):
             # This has do be done every time, because we have filters for
             # different regionsets.
 
-            if rset.get_type():
-                dimension = int(re.match(r"^DIM(_MYST)?(-?\d+)$", rset.get_type()).group(2))
-            else:
-                dimension = 0
+            if rset.get_type().endswith("/entities"):
+                continue
+
+            dimension = int(re.match(r"^DIM(_MYST)?(-?\d+)$", rset.get_type()).group(2))
             dimension = DIMENSION_INT_TO_STR.get(dimension, "minecraft:overworld")
 
             read_dim = data.get("Dimension", "minecraft:overworld")
@@ -427,6 +358,10 @@ def create_marker_from_filter_result(poi, result):
     if "createInfoWindow" in poi:
         d["createInfoWindow"] = poi['createInfoWindow']
 
+    # deprecated, return a dict from your filter func instead.
+    if "cssClass" in poi:
+        d["cssClass"] = poi['cssClass']
+
     # Fill in the rest from result
     if isinstance(result, str):
         d.update(dict(text=result, hovertext=result))
@@ -447,6 +382,13 @@ def create_marker_from_filter_result(poi, result):
             d["icon"] = result['icon']
         if "createInfoWindow" in result:
             d["createInfoWindow"] = result['createInfoWindow']
+
+        if "cssClass" in result:
+            d["cssClass"] = result['cssClass']
+
+        # additional data for post-process jobs
+        if "extra" in result:
+            d["extra"] = result['extra']
 
         # Polylines and polygons
         if (('polyline' in result and hasattr(result['polyline'], '__iter__')) or
@@ -493,17 +435,24 @@ def main():
     parser.add_argument("-p", "--processes", dest="procs", action="store", type=int,
                         help="The number of local worker processes to spawn. Defaults to the "
                         "number of CPU cores your computer has.")
-    parser.add_argument("-q", "--quiet", dest="quiet", action="count",
-                        help="Reduce logging output")
     parser.add_argument("--skip-scan", dest="skipscan", action="store_true",
                         help="Skip scanning for entities when using GenPOI")
     parser.add_argument("--skip-players", dest="skipplayers", action="store_true",
                         help="Skip getting player data when using GenPOI")
 
+    # Log level options:
+    parser.add_argument("-q", "--quiet", dest="quiet", action="count", default=0,
+                        help="Print less output. You can specify this option multiple times.")
+    parser.add_argument("-v", "--verbose", dest="verbose", action="count", default=0,
+                        help="Print more output. You can specify this option multiple times.")
+    parser.add_argument("--simple-output", dest="simple", action="store_true", default=False,
+                        help="Use a simple output format, with no colors or progress bars.")
+
     args = parser.parse_args()
 
-    if args.quiet and args.quiet > 0:
-        logger.configure(logging.WARN, False)
+    # re-configure the logger now that we've processed the command line options
+    logger.configure(logging.INFO + 10 * args.quiet - 10 * args.verbose,
+                     verbose=args.verbose > 0, simple=args.simple)
 
     # Parse the config file
     mw_parser = config_parser.MultiWorldParser()
@@ -528,8 +477,11 @@ def main():
 
     logging.info("Searching renders: %s", list(config['renders']))
 
+    marker_groups_postprocess_functions = dict()
+
     # collect all filters and get regionsets
     for rname, render in config['renders'].items():
+        logging.debug('Render %s processing...', rname)
         # Convert render['world'] to the world path, and store the original
         # in render['worldname_orig']
         try:
@@ -554,13 +506,18 @@ def main():
             logging.warning("Sorry, you requested dimension '%s' for the render '%s', but I "
                             "couldn't find it.", render['dimension'][0], rname)
             continue
+
+        erset = w.get_regionset(render['dimension'][1] + '/entities')
+
         # List of regionsets that should be handled
         rsets = []
         if "crop" in render:
             for zone in render['crop']:
                 rsets.append(world.CroppedRegionSet(rset, *zone))
+                rsets.append(world.CroppedRegionSet(erset, *zone))
         else:
             rsets.append(rset)
+            rsets.append(erset)
 
         # find filters for this render
         for f in render['markers']:
@@ -568,8 +525,11 @@ def main():
             name = (replaceBads(f['name']) + hex(hash(f['filterFunction']))[-4:] + "_"
                     + hex(hash(rname))[-4:])
 
+            logging.debug('Render %s ff %s has name %s', rname, f["filterFunction"].__name__, name)
+
             # add it to the list of filters
             for rset in rsets:
+                logging.debug('Adding %s to %s', name, rset)
                 filters.add((name, f['name'], f['filterFunction'], rset, worldpath, rname))
 
             # add an entry in the menu to show markers found by this filter
@@ -580,6 +540,12 @@ def main():
                 createInfoWindow=f.get('createInfoWindow', True),
                 checked=f.get('checked', False),
                 showIconInLegend=f.get('showIconInLegend', False))
+
+            postprocess_func = f.get('postProcessFunction', None)
+            if postprocess_func is not None:
+                logging.debug('Registering postprocess func %s for %s', postprocess_func.__name__, name)
+                marker_groups_postprocess_functions[name] = postprocess_func
+
             marker_groups[rname].append(group)
 
     # initialize the structure for the markers
@@ -595,6 +561,15 @@ def main():
             rset_filters = list(filter(lambda f: f[3] == rset, filters))
             logging.info("Calling handleEntities for %s with %s filters", rset, len(rset_filters))
             handleEntities(rset, config, args.config, rset_filters, markers)
+
+    for k in markers.keys():
+        logging.debug("Marker group %s: %r", k, json.dumps(markers[k]['raw']))
+
+    # post-process any marker groups that need it
+    logging.info("Running marker post-process")
+    for postprocess_group_name, postprocess_func in marker_groups_postprocess_functions.items():
+        markers[postprocess_group_name]["raw"] = postprocess_func(markers[postprocess_group_name]["raw"])
+        logging.debug("Marker group %s: %r", postprocess_group_name, json.dumps(markers[postprocess_group_name]['raw']))
 
     # apply filters to players
     if not args.skipplayers:
